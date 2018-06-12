@@ -4,8 +4,7 @@ import re
 import os
 import sys
 import xbmc
-import urllib
-import shutil
+import urllib,urllib2
 import xbmcvfs
 import xbmcaddon
 import xbmcgui,xbmcplugin
@@ -28,9 +27,10 @@ sys.path.append (__resource__)
 
 SEARCH_API   = 'http://www.163sub.com/search.ashx?q=%s&lastid=%s'
 DOWNLOAD_API = 'http://www.163sub.com/download/%s'
+USER_AGENT   = 'Mozilla/5.0 (X11; Linux aarch64) AppleWebKit/537.36 (KHTML, like Gecko) Ubuntu Chromium/66.0.3359.181 Chrome/66.0.3359.181 Safari/537.36'
 
 def log(module, msg):
-    xbmc.log((u"%s::%s - %s" % (__scriptname__,module,msg,)).encode('utf-8'),level=xbmc.LOGDEBUG )
+    xbmc.log((u"%s::%s - %s" % (__scriptname__,module,msg,)).encode('utf-8'),level=xbmc.LOGNOTICE)
 
 def normalizeString(str):
     return str
@@ -38,17 +38,25 @@ def normalizeString(str):
 def Search( item ):
     subtitles_list = []
 
-    log( __name__ ,"Search for [%s] by name" % (os.path.basename( item['file_original_path'] ),))
     if item['mansearch']:
-        search_str = urllib.quote(item['mansearchstr'])
+        search_str = item['mansearchstr']
+    elif len(item['tvshow']) > 0:
+        search_str = "%s S%.2dE%.2d" % (item['tvshow'],
+                                        int(item['season']),
+                                        int(item['episode']),)
     else:
-        search_str = urllib.quote(item['title'])
+        search_str = item['title']
+    log( sys._getframe().f_code.co_name ,"Search for [%s] with [%s]" % (os.path.basename( item['file_original_path'] ),search_str.decode('utf-8')))
+    search_str = urllib2.quote(search_str)
     lastid = ''
     results = []
     try:
         while True:
             url = SEARCH_API % (search_str, lastid)
-            socket = urllib.urlopen(url)
+            req = urllib2.Request(url)
+            req.add_header('User-Agent', USER_AGENT)
+            log(sys._getframe().f_code.co_name, url)
+            socket = urllib2.urlopen(req)
             data = socket.read()
             json_response = simplejson.loads(data)
             lastid = json_response['Data'][-1]['linkID']
@@ -57,40 +65,88 @@ def Search( item ):
                 break
         socket.close()
     except:
-        return
+        raise
     for sub in results:
-        version = sub['fileName'].encode('utf-8').replace('&amp;','&')
-        version = version[:-4]
+        version = sub['mkvName'].encode('utf-8')
         if version[-4:] in ('.rar', '.zip'):
             version = version[:-4]
-        langs = sub['language'].encode('utf-8')
-        id = sub['ID'].encode('utf-8')
-        ext = sub['sext'].encode('utf-8')
-        name = '[%s]%s (%s)' % (ext, version, langs)
-        if ('简' in langs) or ('繁' in langs) or ('中' in langs) or ('双' in langs):
-            subtitles_list.append({"language_name":"Chinese", "filename":name, "link":id, "language_flag":'zh', "rating":"0", "lang":langs})
+        title = sub['enName'].encode('utf-8')
+        if (len(re.findall(r"[\w']+", version)) < 5):
+            if (title.find(version) == -1):
+                version = title + ' ' + version
+            else:
+                version = title
+        info = sub['otherName2'].encode('utf-8')
+        langs = []
+        lang_list = ['双语', '简体', '繁体', '英文']
+        for x in lang_list:
+            if (info.find(x) != -1):
+                langs.append(x)
+        if (len(langs) == 0):
+            langs.append('未知语言')
+            lang_name = 'Chinese'
+            lang_flag = 'zh'
+        elif (len(langs) == 1) and (langs[0] == '英文'):
+            lang_name = 'English'
+            lang_flag = 'en'
         else:
-            subtitles_list.append({"language_name":"English", "filename":name, "link":id, "language_flag":'en', "rating":"0", "lang":langs})
+            lang_name = 'Chinese'
+            lang_flag = 'zh'
+        id = sub['ID'].encode('utf-8')
+        group = sub['subFrom'].encode('utf-8')
+        if (group != '转载/未知/其他') and (group != '见字幕文件') and (version.find(group) == -1):
+            version += ' ' + group
+        name = '%s (%s)' % (version, ",".join(langs))
+        subtitles_list.append({"language_name":lang_name, "filename":name, "link":id, "language_flag":lang_flag, "rating":"0", "lang":langs})
 
     if subtitles_list:
         for it in subtitles_list:
             listitem = xbmcgui.ListItem(label=it["language_name"],
-                                  label2=it["filename"],
-                                  iconImage=it["rating"],
-                                  thumbnailImage=it["language_flag"]
-                                  )
+                                        label2=it["filename"],
+                                        iconImage=it["rating"],
+                                        thumbnailImage=it["language_flag"]
+                                       )
 
             listitem.setProperty( "sync", "false" )
             listitem.setProperty( "hearing_imp", "false" )
 
             url = "plugin://%s/?action=download&link=%s&lang=%s" % (__scriptid__,
-                                                                        it["link"],
-                                                                        it["lang"]
-                                                                        )
+                                                                    it["link"],
+                                                                    it["lang"]
+                                                                    )
             xbmcplugin.addDirectoryItem(handle=int(sys.argv[1]),url=url,listitem=listitem,isFolder=False)
 
+def rmtree(path):
+    if isinstance(path, unicode):
+        path = path.encode('utf-8')
+    dirs, files = xbmcvfs.listdir(path)
+    for dir in dirs:
+        rmtree(os.path.join(path, dir))
+    for file in files:
+        xbmcvfs.delete(os.path.join(path, file))
+    xbmcvfs.rmdir(path)
+
+def DownloadLinks(links):
+    for link in links:
+        url = link.get('href').encode('utf-8')
+        filename = os.path.basename(url)
+        try:
+            log(sys._getframe().f_code.co_name, "Trying %s" % (url))
+            req = urllib2.Request(url)
+            req.add_header('User-Agent', USER_AGENT)
+            socket = urllib2.urlopen(req)
+            data = socket.read()
+            socket.close()
+            if len(data) > 1024:
+                return filename, data
+            else:
+                return '', ''
+        except Exception, e:
+            log(sys._getframe().f_code.co_name, "Failed to access %s" % (url))
+    return '', ''
+
 def Download(id,lang):
-    try: shutil.rmtree(__temp__)
+    try: rmtree(__temp__)
     except: pass
     try: os.makedirs(__temp__)
     except: pass
@@ -99,39 +155,40 @@ def Download(id,lang):
     exts = [".srt", ".sub", ".smi", ".ssa", ".ass" ]
     url = DOWNLOAD_API % (id)
     try:
-        socket = urllib.urlopen( url )
-        data = socket.read()
-        soup = BeautifulSoup(data)
-        url = soup.find("a", class_="down_ink download_link").get('href').encode('utf-8')
-        socket = urllib.urlopen( url )
-        filename = socket.headers['Content-Disposition'].split('filename=')[1]
-        if filename[0] == '"' or filename[0] == "'":
-            filename = filename[1:-1]
+        req = urllib2.Request(url)
+        req.add_header('User-Agent', USER_AGENT)
+        socket = urllib2.urlopen(req)
         data = socket.read()
         socket.close()
+        soup = BeautifulSoup(data, "html.parser")
+        links = soup.find_all("a", class_="down_ink download_link")
     except:
         return []
+    filename, data = DownloadLinks(links)
     if len(data) < 1024:
         return []
-    tempfile = os.path.join(__temp__, "subtitles%s" % os.path.splitext(filename)[1])
+    temp = __temp__
+    tempfile = os.path.join(temp, "subtitles%s" % os.path.splitext(filename)[1])
     with open(tempfile, "wb") as subFile:
         subFile.write(data)
     subFile.close()
-    xbmc.sleep(500)
+    #xbmc.sleep(500)
     if data[:4] == 'Rar!' or data[:2] == 'PK':
-        xbmc.executebuiltin(('XBMC.Extract("%s","%s")' % (tempfile,__temp__,)).encode('utf-8'), True)
-    path = __temp__
-    dirs, files = xbmcvfs.listdir(path)
+        temp = 'rar://' + urllib.quote_plus(tempfile)
+    path = temp
+    dirs, files = xbmcvfs.listdir(path + '/')
+    if ('__MACOSX') in dirs:
+        dirs.remove('__MACOSX')
     if len(dirs) > 0:
-        path = os.path.join(__temp__, dirs[0].decode('utf-8'))
-        dirs, files = xbmcvfs.listdir(path)
+        path = os.path.join(temp, dirs[0].decode('utf-8'))
+        dirs, files = xbmcvfs.listdir(path + '/')
     list = []
     for subfile in files:
-        if (os.path.splitext( subfile )[1] in exts):
+        if (os.path.splitext(subfile)[1] in exts):
             list.append(subfile.decode('utf-8'))
     if len(list) == 1:
         subtitle_list.append(os.path.join(path, list[0]))
-    else:
+    elif len(list) > 1:
         sel = xbmcgui.Dialog().select('请选择压缩包中的字幕', list)
         if sel == -1:
             sel = 0
@@ -168,14 +225,14 @@ if params['action'] == 'search' or params['action'] == 'manualsearch':
     item['episode']            = str(xbmc.getInfoLabel("VideoPlayer.Episode"))                   # Episode
     item['tvshow']             = normalizeString(xbmc.getInfoLabel("VideoPlayer.TVshowtitle"))   # Show
     item['title']              = normalizeString(xbmc.getInfoLabel("VideoPlayer.OriginalTitle")) # try to get original title
-    item['file_original_path'] = urllib.unquote(xbmc.Player().getPlayingFile().decode('utf-8'))  # Full path of a playing file
+    item['file_original_path'] = urllib2.unquote(xbmc.Player().getPlayingFile().decode('utf-8'))  # Full path of a playing file
     item['3let_language']      = []
 
     if 'searchstring' in params:
         item['mansearch'] = True
         item['mansearchstr'] = params['searchstring']
 
-    for lang in urllib.unquote(params['languages']).decode('utf-8').split(","):
+    for lang in urllib2.unquote(params['languages']).decode('utf-8').split(","):
         item['3let_language'].append(xbmc.convertLanguage(lang,xbmc.ISO_639_2))
 
     if item['title'] == "":
